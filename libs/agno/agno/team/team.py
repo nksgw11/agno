@@ -105,6 +105,7 @@ from agno.utils.response import (
 from agno.utils.safe_formatter import SafeFormatter
 from agno.utils.string import parse_response_model_str
 from agno.utils.team import format_member_agent_task, get_member_id
+from agno.utils.common import validate_typed_dict, is_typed_dict
 from agno.utils.timer import Timer
 
 
@@ -408,6 +409,7 @@ class Team:
         enable_agentic_memory: bool = False,
         enable_user_memories: bool = False,
         add_memories_to_context: Optional[bool] = None,
+        memory_manager: Optional[MemoryManager] = None,
         enable_session_summaries: bool = False,
         session_summary_manager: Optional[SessionSummaryManager] = None,
         add_session_summary_to_context: Optional[bool] = None,
@@ -505,6 +507,7 @@ class Team:
         self.enable_agentic_memory = enable_agentic_memory
         self.enable_user_memories = enable_user_memories
         self.add_memories_to_context = add_memories_to_context
+        self.memory_manager = memory_manager
         self.enable_session_summaries = enable_session_summaries
         self.session_summary_manager = session_summary_manager
         self.add_session_summary_to_context = add_session_summary_to_context
@@ -619,8 +622,6 @@ class Team:
         if isinstance(input, BaseModel):
             if isinstance(input, self.input_schema):
                 try:
-                    # Re-validate to catch any field validation errors
-                    input.model_validate(input.model_dump())
                     return input
                 except Exception as e:
                     raise ValueError(f"BaseModel validation failed: {str(e)}")
@@ -631,8 +632,13 @@ class Team:
         # Case 2: Message is a dict
         elif isinstance(input, dict):
             try:
-                validated_model = self.input_schema(**input)
-                return validated_model
+                # Check if the schema is a TypedDict
+                if is_typed_dict(self.input_schema):
+                    validated_dict = validate_typed_dict(input, self.input_schema)  
+                    return validated_dict
+                else:
+                    validated_model = self.input_schema(**input)
+                    return validated_model
             except Exception as e:
                 raise ValueError(f"Failed to parse dict into {self.input_schema.__name__}: {str(e)}")
 
@@ -2282,11 +2288,13 @@ class Team:
                             tc.tool_call_id: i for i, tc in enumerate(run_response.tools) if tc.tool_call_id is not None
                         }
                         # Process tool calls
-                        for tool_call_dict in tool_executions_list:
-                            tool_call_id = tool_call_dict.tool_call_id or ""
+                        for tool_execution in tool_executions_list:
+                            tool_call_id = tool_execution.tool_call_id or ""
                             index = tool_call_index_map.get(tool_call_id)
                             if index is not None:
-                                run_response.tools[index] = tool_call_dict
+                                if run_response.tools[index].child_run_id is not None:
+                                    tool_execution.child_run_id = run_response.tools[index].child_run_id
+                                run_response.tools[index] = tool_execution
                     else:
                         run_response.tools = tool_executions_list
 
@@ -4595,7 +4603,12 @@ class Team:
             # If message is provided as a dict, try to validate it as a Message
             elif isinstance(input_message, dict):
                 try:
-                    return Message.model_validate(input_message)
+                    if self.input_schema and is_typed_dict(self.input_schema):
+                        import json
+                        content = json.dumps(input_message, indent=2, ensure_ascii=False)
+                        return Message(role="user", content=content)
+                    else:
+                        return Message.model_validate(input_message)
                 except Exception as e:
                     log_warning(f"Failed to validate input: {e}")
 
@@ -5155,6 +5168,12 @@ class Team:
             # Add team run id to the member run
             if member_agent_run_response is not None:
                 member_agent_run_response.parent_run_id = run_response.run_id  # type: ignore
+
+            # Update the top-level team run_response tool call to have the run_id of the member run
+            if run_response.tools is not None:
+                for tool in run_response.tools:
+                    if tool.tool_name and tool.tool_name.lower() == "delegate_task_to_member":
+                        tool.child_run_id = member_agent_run_response.run_id  # type: ignore
 
             # Update the team run context
             member_name = member_agent.name if member_agent.name else member_agent.id if member_agent.id else "Unknown"
@@ -6040,7 +6059,8 @@ class Team:
         session = self.get_session(session_id=session_id)  # type: ignore
 
         if session is None:
-            raise Exception("Session not found")
+            log_warning(f"Session {session_id} not found")
+            return []
 
         # Only filter by agent_id if this is part of a team
         return session.get_messages_from_last_n_runs(
